@@ -1,0 +1,4 @@
+interface:
+  display_name: "Notion"
+  short_description: "Use Notion through a bundled CLI"
+  default_prompt: "Use $notion to search, read, update, or export Notion content through the bundled CLI."

@@ -1,0 +1,1170 @@
+#!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = []
+# ///
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+
+DEFAULT_NOTION_VERSION = "2026-03-11"
+API_BASE = "https://api.notion.com/v1"
+NOTION_ENV_FILES = [
+    Path.home() / ".notion" / "env",
+    Path.home() / ".notion" / "notion.env",
+    Path.home() / ".notion" / ".env",
+]
+AUTH_SETUP_STATUSES = {401, 403}
+AUTH_SETUP_CODES = {
+    "restricted_resource",
+    "unauthorized",
+}
+
+
+class NotionError(RuntimeError):
+    def __init__(self, status: int, reason: str, message: str, code: str | None = None) -> None:
+        self.status = status
+        self.reason = reason
+        self.code = code
+        self.message = message
+        detail = f"Notion API {status} {reason}: {message}"
+        if code:
+            detail = f"{detail} ({code})"
+        super().__init__(detail)
+
+
+class NotionClient:
+    def __init__(self, token: str, notion_version: str = DEFAULT_NOTION_VERSION) -> None:
+        self.token = token
+        self.notion_version = notion_version
+
+    def get(self, path: str) -> dict[str, Any]:
+        return self.request("GET", path)
+
+    def post(self, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+        return self.request("POST", path, body)
+
+    def patch(self, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+        return self.request("PATCH", path, body)
+
+    def delete(self, path: str) -> dict[str, Any]:
+        return self.request("DELETE", path)
+
+    def request(self, method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+        url = path if path.startswith("http") else f"{API_BASE}{path}"
+        payload = None if body is None else json.dumps(body).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=payload,
+            method=method,
+            headers={
+                "Authorization": f"Bearer {self.token}",
+                "Notion-Version": self.notion_version,
+                "Content-Type": "application/json",
+            },
+        )
+
+        try:
+            with urllib.request.urlopen(request) as response:
+                raw = response.read().decode("utf-8")
+        except urllib.error.HTTPError as error:
+            if error.code == 429:
+                retry_after = error.headers.get("Retry-After")
+                if retry_after and retry_after.isdigit():
+                    time.sleep(int(retry_after))
+                    return self.request(method, path, body)
+
+            raw = error.read().decode("utf-8", errors="replace")
+            try:
+                payload_data = json.loads(raw)
+                message = payload_data.get("message", raw)
+                code = payload_data.get("code")
+            except json.JSONDecodeError:
+                message = raw
+                code = None
+            raise NotionError(error.code, error.reason, message, code) from error
+
+        if not raw:
+            return {}
+        return json.loads(raw)
+
+    def collect_paginated_get(
+        self,
+        path: str,
+        query: dict[str, str] | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        query = dict(query or {})
+        results: list[dict[str, Any]] = []
+        cursor = query.get("start_cursor")
+
+        while True:
+            page_size = 100 if limit is None else min(100, max(1, limit - len(results)))
+            query["page_size"] = str(page_size)
+            if cursor:
+                query["start_cursor"] = cursor
+            else:
+                query.pop("start_cursor", None)
+
+            response = self.get(f"{path}?{urllib.parse.urlencode(query)}")
+            results.extend(response.get("results", []))
+            if limit is not None and len(results) >= limit:
+                return results[:limit]
+            if not response.get("has_more"):
+                return results
+            cursor = response.get("next_cursor")
+
+    def collect_paginated_post(
+        self,
+        path: str,
+        body: dict[str, Any] | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        body = dict(body or {})
+        results: list[dict[str, Any]] = []
+        cursor = body.get("start_cursor")
+
+        while True:
+            page_size = 100 if limit is None else min(100, max(1, limit - len(results)))
+            body["page_size"] = page_size
+            if cursor:
+                body["start_cursor"] = cursor
+            else:
+                body.pop("start_cursor", None)
+
+            response = self.post(path, body)
+            results.extend(response.get("results", []))
+            if limit is not None and len(results) >= limit:
+                return results[:limit]
+            if not response.get("has_more"):
+                return results
+            cursor = response.get("next_cursor")
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+
+    try:
+        if not getattr(args, "requires_auth", True):
+            return args.func(None, args)
+
+        load_env_files([Path(path).expanduser() for path in args.env_file] if args.env_file else NOTION_ENV_FILES)
+        token = os.environ.get("NOTION_TOKEN") or os.environ.get("NOTION_API_KEY") or os.environ.get("NTN_TOKEN")
+        if not token:
+            print(build_notion_setup_text(), file=sys.stdout)
+            return 1
+
+        client = NotionClient(token=token, notion_version=args.notion_version)
+        return args.func(client, args)
+    except (NotionError, RuntimeError, ValueError, OSError, json.JSONDecodeError) as error:
+        if isinstance(error, NotionError) and is_auth_setup_error(error):
+            print(str(error), file=sys.stderr)
+            print(build_notion_setup_text(), file=sys.stdout)
+            return 1
+        print(str(error), file=sys.stderr)
+        return 1
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="notion-cli",
+        description="Single-file Notion API CLI using ~/.notion/env credentials.",
+    )
+    parser.add_argument(
+        "--notion-version",
+        default=os.environ.get("NOTION_VERSION", DEFAULT_NOTION_VERSION),
+        help=f"Notion-Version header. Default: {DEFAULT_NOTION_VERSION}",
+    )
+    parser.add_argument(
+        "--env-file",
+        action="append",
+        help="Credential env file to load. Defaults to ~/.notion/env and compatible fallbacks.",
+    )
+
+    subparsers = parser.add_subparsers(required=True)
+
+    add_setup_parser(subparsers)
+    add_me_parser(subparsers)
+    add_api_parser(subparsers)
+    add_search_parser(subparsers)
+    add_page_parser(subparsers)
+    add_block_parser(subparsers)
+    add_comment_parser(subparsers)
+    add_database_parser(subparsers)
+    add_data_source_parser(subparsers)
+    add_user_parser(subparsers)
+
+    return parser
+
+
+def add_setup_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    parser = subparsers.add_parser("setup", help="Print Notion integration setup and credential instructions.")
+    output = parser.add_mutually_exclusive_group()
+    output.add_argument("--env-only", action="store_true", help="Print only the local credential-file instructions.")
+    output.add_argument("--capabilities-only", action="store_true", help="Print only the integration capability checklist.")
+    output.add_argument("--oauth-note", action="store_true", help="Print a note about public OAuth integrations.")
+    parser.set_defaults(func=cmd_setup, requires_auth=False)
+
+
+def add_me_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    parser = subparsers.add_parser("me", help="Show the integration user for the active token.")
+    parser.set_defaults(func=cmd_me)
+
+
+def add_api_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    parser = subparsers.add_parser("api", help="Call any Notion API endpoint.")
+    parser.add_argument("method", choices=["GET", "POST", "PATCH", "DELETE"])
+    parser.add_argument("path", help="API path such as /pages/<id>, or a full https://api.notion.com/v1 URL.")
+    parser.add_argument("--data", help="JSON request body, @file.json, or - for stdin.")
+    parser.add_argument("--query", action="append", default=[], help="Append query params as key=value.")
+    parser.add_argument("--paginate", action="store_true", help="Collect paginated list results.")
+    parser.set_defaults(func=cmd_api)
+
+
+def add_search_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    parser = subparsers.add_parser("search", help="Search shared pages and data sources by title.")
+    parser.add_argument("query", nargs="?", default="")
+    parser.add_argument("--object", choices=["page", "data_source"])
+    parser.add_argument("--limit", type=int, default=25)
+    parser.add_argument("--json", action="store_true", help="Print raw JSON results.")
+    parser.set_defaults(func=cmd_search)
+
+
+def add_page_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    page = subparsers.add_parser("page", help="Read, create, update, export, trash, or restore pages.")
+    page_sub = page.add_subparsers(required=True)
+
+    get = page_sub.add_parser("get", help="Retrieve a page object.")
+    get.add_argument("page")
+    get.set_defaults(func=cmd_page_get)
+
+    export = page_sub.add_parser("export", help="Export page content to Markdown and raw JSON.")
+    export.add_argument("page")
+    export.add_argument("output_base", nargs="?", default="notion-page")
+    export.add_argument("--no-json", action="store_true", help="Do not write the raw JSON sidecar file.")
+    export.set_defaults(func=cmd_page_export)
+
+    create = page_sub.add_parser("create", help="Create a page.")
+    create.add_argument("--body", help="Full JSON body, @file.json, or - for stdin. Overrides convenience flags.")
+    create.add_argument("--parent-page", help="Create as child of this page.")
+    create.add_argument("--parent-data-source", help="Create as entry in this data source.")
+    create.add_argument("--workspace", action="store_true", help="Create a workspace-level private page when supported.")
+    create.add_argument("--title", help="Convenience page title.")
+    create.add_argument("--title-property", default="title", help="Title property name. Use Name for many data sources.")
+    create.add_argument("--properties", help="Additional page properties JSON, @file.json, or - for stdin.")
+    create.add_argument("--markdown", help="Convenience block Markdown to add as children.")
+    create.add_argument("--markdown-file", help="Read convenience block Markdown from a file.")
+    create.set_defaults(func=cmd_page_create)
+
+    update = page_sub.add_parser("update", help="Update page metadata/properties.")
+    update.add_argument("page")
+    update.add_argument("--body", help="Full PATCH body JSON, @file.json, or - for stdin. Merged after convenience flags.")
+    update.add_argument("--title", help="Convenience title update.")
+    update.add_argument("--title-property", default="title", help="Title property name. Use Name for many data sources.")
+    update.add_argument("--properties", help="Properties JSON, @file.json, or - for stdin.")
+    update.add_argument("--icon-emoji", help="Set page icon emoji.")
+    update.add_argument("--cover-url", help="Set page cover to an external URL.")
+    update.add_argument("--trash", action="store_true", help="Move the page to trash.")
+    update.add_argument("--restore", action="store_true", help="Restore the page from trash.")
+    update.set_defaults(func=cmd_page_update)
+
+    delete = page_sub.add_parser("delete", help="Trash a page. Notion does not expose permanent page delete.")
+    delete.add_argument("page")
+    delete.set_defaults(func=cmd_page_delete)
+
+    restore = page_sub.add_parser("restore", help="Restore a page from trash.")
+    restore.add_argument("page")
+    restore.set_defaults(func=cmd_page_restore)
+
+
+def add_block_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    block = subparsers.add_parser("block", help="Read, append, update, or delete blocks.")
+    block_sub = block.add_subparsers(required=True)
+
+    get = block_sub.add_parser("get", help="Retrieve a block.")
+    get.add_argument("block")
+    get.set_defaults(func=cmd_block_get)
+
+    children = block_sub.add_parser("children", help="Retrieve block/page children.")
+    children.add_argument("block")
+    children.add_argument("--recursive", action="store_true")
+    children.add_argument("--limit", type=int)
+    children.add_argument("--markdown", action="store_true", help="Render children as Markdown.")
+    children.set_defaults(func=cmd_block_children)
+
+    append = block_sub.add_parser("append", help="Append children to a block or page.")
+    append.add_argument("block")
+    append.add_argument("--body", help="Full PATCH body JSON, @file.json, or - for stdin.")
+    append.add_argument("--children", help="JSON children array, @file.json, or - for stdin.")
+    append.add_argument("--markdown", help="Convenience Markdown to append.")
+    append.add_argument("--markdown-file", help="Read convenience Markdown from a file.")
+    append.set_defaults(func=cmd_block_append)
+
+    update = block_sub.add_parser("update", help="Update a block.")
+    update.add_argument("block")
+    update.add_argument("--body", help="Full PATCH body JSON, @file.json, or - for stdin.")
+    update.add_argument("--type", choices=["paragraph", "heading_1", "heading_2", "heading_3", "bulleted_list_item", "numbered_list_item", "quote", "to_do", "code"])
+    update.add_argument("--text", help="Convenience rich text content for supported block types.")
+    update.add_argument("--checked", choices=["true", "false"], help="Set to_do checked state.")
+    update.set_defaults(func=cmd_block_update)
+
+    delete = block_sub.add_parser("delete", help="Delete/trash a block.")
+    delete.add_argument("block")
+    delete.set_defaults(func=cmd_block_delete)
+
+
+def add_comment_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    comment = subparsers.add_parser("comment", help="List, create, update, or delete comments.")
+    comment_sub = comment.add_subparsers(required=True)
+
+    list_parser = comment_sub.add_parser("list", help="List unresolved comments for a page or block.")
+    list_parser.add_argument("block")
+    list_parser.add_argument("--limit", type=int, default=100)
+    list_parser.set_defaults(func=cmd_comment_list)
+
+    get = comment_sub.add_parser("get", help="Retrieve one comment.")
+    get.add_argument("comment")
+    get.set_defaults(func=cmd_comment_get)
+
+    create = comment_sub.add_parser("create", help="Create a comment on a page, block, or discussion.")
+    parent = create.add_mutually_exclusive_group(required=True)
+    parent.add_argument("--page")
+    parent.add_argument("--block")
+    parent.add_argument("--discussion")
+    create.add_argument("--text", help="Plain text comment body.")
+    create.add_argument("--markdown", help="Markdown comment body.")
+    create.add_argument("--markdown-file", help="Read Markdown comment body from file.")
+    create.set_defaults(func=cmd_comment_create)
+
+    update = comment_sub.add_parser("update", help="Update a comment created by this connection.")
+    update.add_argument("comment")
+    update.add_argument("--text", help="Plain text comment body.")
+    update.add_argument("--markdown", help="Markdown comment body.")
+    update.add_argument("--markdown-file", help="Read Markdown comment body from file.")
+    update.set_defaults(func=cmd_comment_update)
+
+    delete = comment_sub.add_parser("delete", help="Delete a comment created by this connection.")
+    delete.add_argument("comment")
+    delete.set_defaults(func=cmd_comment_delete)
+
+
+def add_database_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    database = subparsers.add_parser("database", help="Database helpers. Use data-source for 2026 row queries.")
+    database_sub = database.add_subparsers(required=True)
+
+    get = database_sub.add_parser("get", help="Retrieve a database.")
+    get.add_argument("database")
+    get.set_defaults(func=cmd_database_get)
+
+    create = database_sub.add_parser("create", help="Create a database with a full JSON body.")
+    create.add_argument("--body", required=True, help="JSON body, @file.json, or - for stdin.")
+    create.set_defaults(func=cmd_database_create)
+
+    update = database_sub.add_parser("update", help="Update a database with a JSON body.")
+    update.add_argument("database")
+    update.add_argument("--body", required=True, help="JSON body, @file.json, or - for stdin.")
+    update.set_defaults(func=cmd_database_update)
+
+
+def add_data_source_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    data_source = subparsers.add_parser("data-source", help="Data source helpers.")
+    data_source_sub = data_source.add_subparsers(required=True)
+
+    get = data_source_sub.add_parser("get", help="Retrieve a data source.")
+    get.add_argument("data_source")
+    get.set_defaults(func=cmd_data_source_get)
+
+    query = data_source_sub.add_parser("query", help="Query a data source.")
+    query.add_argument("data_source")
+    query.add_argument("--body", help="Query JSON body, @file.json, or - for stdin.")
+    query.add_argument("--limit", type=int)
+    query.set_defaults(func=cmd_data_source_query)
+
+    create = data_source_sub.add_parser("create", help="Create a data source with a full JSON body.")
+    create.add_argument("--body", required=True, help="JSON body, @file.json, or - for stdin.")
+    create.set_defaults(func=cmd_data_source_create)
+
+    update = data_source_sub.add_parser("update", help="Update a data source with a JSON body.")
+    update.add_argument("data_source")
+    update.add_argument("--body", required=True, help="JSON body, @file.json, or - for stdin.")
+    update.set_defaults(func=cmd_data_source_update)
+
+
+def add_user_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    user = subparsers.add_parser("user", help="User helpers.")
+    user_sub = user.add_subparsers(required=True)
+
+    get = user_sub.add_parser("get", help="Retrieve a user.")
+    get.add_argument("user")
+    get.set_defaults(func=cmd_user_get)
+
+    list_parser = user_sub.add_parser("list", help="List users.")
+    list_parser.add_argument("--limit", type=int, default=100)
+    list_parser.set_defaults(func=cmd_user_list)
+
+
+def cmd_setup(_client: NotionClient | None, args: argparse.Namespace) -> int:
+    if args.env_only:
+        print(build_notion_env_setup_text().rstrip())
+    elif args.capabilities_only:
+        print(build_notion_capabilities_text().rstrip())
+    elif args.oauth_note:
+        print(build_notion_oauth_note_text().rstrip())
+    else:
+        print(build_notion_setup_text().rstrip())
+    return 0
+
+
+def cmd_me(client: NotionClient, _args: argparse.Namespace) -> int:
+    emit_json(client.get("/users/me"))
+    return 0
+
+
+def cmd_api(client: NotionClient, args: argparse.Namespace) -> int:
+    body = read_json_arg(args.data) if args.data else None
+
+    if args.paginate:
+        if args.method == "GET":
+            path, query = split_path_query(args.path)
+            query.update(query_pairs_to_dict(args.query))
+            emit_json(client.collect_paginated_get(path, query))
+            return 0
+        if args.method == "POST":
+            path = add_query_params(args.path, args.query)
+            emit_json(client.collect_paginated_post(path, body))
+            return 0
+        raise ValueError("--paginate is only supported for GET and POST list endpoints.")
+
+    path = add_query_params(args.path, args.query)
+    emit_json(client.request(args.method, path, body))
+    return 0
+
+
+def cmd_search(client: NotionClient, args: argparse.Namespace) -> int:
+    body: dict[str, Any] = {
+        "query": args.query,
+        "sort": {"direction": "descending", "timestamp": "last_edited_time"},
+    }
+    if args.object:
+        body["filter"] = {"property": "object", "value": args.object}
+
+    results = client.collect_paginated_post("/search", body, limit=args.limit)
+    if args.json:
+        emit_json(results)
+    else:
+        for item in results:
+            title = object_title(item)
+            print(f"{item.get('object')}\t{item.get('id')}\t{title}\t{item.get('url', '')}")
+    return 0
+
+
+def cmd_page_get(client: NotionClient, args: argparse.Namespace) -> int:
+    emit_json(client.get(f"/pages/{parse_notion_id(args.page)}"))
+    return 0
+
+
+def cmd_page_export(client: NotionClient, args: argparse.Namespace) -> int:
+    page_id = parse_notion_id(args.page)
+    page = client.get(f"/pages/{page_id}")
+    blocks = list_block_children(client, page_id)
+    title = page_title(page)
+    markdown = f"# {title}\n\n{blocks_to_markdown(blocks)}\n"
+
+    out_base = Path(args.output_base)
+    markdown_path = output_path(out_base, ".md")
+    markdown_path.write_text(markdown, encoding="utf-8")
+    print(f"Wrote {markdown_path}")
+
+    if not args.no_json:
+        json_path = output_path(out_base, ".json")
+        json_path.write_text(to_json({"page": page, "blocks": blocks}), encoding="utf-8")
+        print(f"Wrote {json_path}")
+    return 0
+
+
+def cmd_page_create(client: NotionClient, args: argparse.Namespace) -> int:
+    body = read_json_arg(args.body) if args.body else build_page_create_body(args)
+    emit_json(client.post("/pages", body))
+    return 0
+
+
+def cmd_page_update(client: NotionClient, args: argparse.Namespace) -> int:
+    if args.trash and args.restore:
+        raise ValueError("Use only one of --trash or --restore.")
+
+    body: dict[str, Any] = {}
+    if args.properties:
+        body["properties"] = read_json_arg(args.properties)
+    if args.title:
+        body.setdefault("properties", {})[args.title_property] = title_property(args.title)
+    if args.icon_emoji:
+        body["icon"] = {"type": "emoji", "emoji": args.icon_emoji}
+    if args.cover_url:
+        body["cover"] = {"type": "external", "external": {"url": args.cover_url}}
+    if args.trash:
+        body["in_trash"] = True
+    if args.restore:
+        body["in_trash"] = False
+    if args.body:
+        body.update(read_json_arg(args.body))
+    if not body:
+        raise ValueError("Nothing to update. Provide --body, --title, --properties, --trash, or another update flag.")
+
+    emit_json(client.patch(f"/pages/{parse_notion_id(args.page)}", body))
+    return 0
+
+
+def cmd_page_delete(client: NotionClient, args: argparse.Namespace) -> int:
+    emit_json(client.patch(f"/pages/{parse_notion_id(args.page)}", {"in_trash": True}))
+    return 0
+
+
+def cmd_page_restore(client: NotionClient, args: argparse.Namespace) -> int:
+    emit_json(client.patch(f"/pages/{parse_notion_id(args.page)}", {"in_trash": False}))
+    return 0
+
+
+def cmd_block_get(client: NotionClient, args: argparse.Namespace) -> int:
+    emit_json(client.get(f"/blocks/{parse_notion_id(args.block)}"))
+    return 0
+
+
+def cmd_block_children(client: NotionClient, args: argparse.Namespace) -> int:
+    block_id = parse_notion_id(args.block)
+    blocks = list_block_children(client, block_id, recursive=args.recursive, limit=args.limit)
+    if args.markdown:
+        print(blocks_to_markdown(blocks))
+    else:
+        emit_json(blocks)
+    return 0
+
+
+def cmd_block_append(client: NotionClient, args: argparse.Namespace) -> int:
+    body = read_json_arg(args.body) if args.body else {"children": build_children_from_args(args)}
+    emit_json(client.patch(f"/blocks/{parse_notion_id(args.block)}/children", body))
+    return 0
+
+
+def cmd_block_update(client: NotionClient, args: argparse.Namespace) -> int:
+    if args.body:
+        body = read_json_arg(args.body)
+    else:
+        if not args.type:
+            raise ValueError("Provide --body or --type for block update.")
+        if args.text is None and args.checked is None:
+            raise ValueError("Provide --text or --checked with --type.")
+        body = build_block_update_body(args.type, args.text, args.checked)
+
+    emit_json(client.patch(f"/blocks/{parse_notion_id(args.block)}", body))
+    return 0
+
+
+def cmd_block_delete(client: NotionClient, args: argparse.Namespace) -> int:
+    emit_json(client.delete(f"/blocks/{parse_notion_id(args.block)}"))
+    return 0
+
+
+def cmd_comment_list(client: NotionClient, args: argparse.Namespace) -> int:
+    results = client.collect_paginated_get(
+        "/comments",
+        {"block_id": parse_notion_id(args.block)},
+        limit=args.limit,
+    )
+    emit_json(results)
+    return 0
+
+
+def cmd_comment_get(client: NotionClient, args: argparse.Namespace) -> int:
+    emit_json(client.get(f"/comments/{parse_notion_id(args.comment)}"))
+    return 0
+
+
+def cmd_comment_create(client: NotionClient, args: argparse.Namespace) -> int:
+    body = comment_body(args)
+    if args.page:
+        body["parent"] = {"page_id": parse_notion_id(args.page)}
+    elif args.block:
+        body["parent"] = {"block_id": parse_notion_id(args.block)}
+    elif args.discussion:
+        body["discussion_id"] = parse_notion_id(args.discussion)
+    emit_json(client.post("/comments", body))
+    return 0
+
+
+def cmd_comment_update(client: NotionClient, args: argparse.Namespace) -> int:
+    emit_json(client.patch(f"/comments/{parse_notion_id(args.comment)}", comment_body(args)))
+    return 0
+
+
+def cmd_comment_delete(client: NotionClient, args: argparse.Namespace) -> int:
+    emit_json(client.delete(f"/comments/{parse_notion_id(args.comment)}"))
+    return 0
+
+
+def cmd_database_get(client: NotionClient, args: argparse.Namespace) -> int:
+    emit_json(client.get(f"/databases/{parse_notion_id(args.database)}"))
+    return 0
+
+
+def cmd_database_create(client: NotionClient, args: argparse.Namespace) -> int:
+    emit_json(client.post("/databases", read_json_arg(args.body)))
+    return 0
+
+
+def cmd_database_update(client: NotionClient, args: argparse.Namespace) -> int:
+    emit_json(client.patch(f"/databases/{parse_notion_id(args.database)}", read_json_arg(args.body)))
+    return 0
+
+
+def cmd_data_source_get(client: NotionClient, args: argparse.Namespace) -> int:
+    emit_json(client.get(f"/data_sources/{parse_notion_id(args.data_source)}"))
+    return 0
+
+
+def cmd_data_source_query(client: NotionClient, args: argparse.Namespace) -> int:
+    body = read_json_arg(args.body) if args.body else {}
+    if args.limit:
+        emit_json(client.collect_paginated_post(f"/data_sources/{parse_notion_id(args.data_source)}/query", body, args.limit))
+    else:
+        emit_json(client.post(f"/data_sources/{parse_notion_id(args.data_source)}/query", body))
+    return 0
+
+
+def cmd_data_source_create(client: NotionClient, args: argparse.Namespace) -> int:
+    emit_json(client.post("/data_sources", read_json_arg(args.body)))
+    return 0
+
+
+def cmd_data_source_update(client: NotionClient, args: argparse.Namespace) -> int:
+    emit_json(client.patch(f"/data_sources/{parse_notion_id(args.data_source)}", read_json_arg(args.body)))
+    return 0
+
+
+def cmd_user_get(client: NotionClient, args: argparse.Namespace) -> int:
+    emit_json(client.get(f"/users/{parse_notion_id(args.user)}"))
+    return 0
+
+
+def cmd_user_list(client: NotionClient, args: argparse.Namespace) -> int:
+    emit_json(client.collect_paginated_get("/users", limit=args.limit))
+    return 0
+
+
+def load_env_files(paths: list[Path]) -> None:
+    for path in paths:
+        if path.exists():
+            load_env_file(path)
+
+
+def load_env_file(path: Path) -> None:
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+
+        key, separator, value = line.partition("=")
+        if not separator:
+            continue
+        key = key.strip()
+        if key and key not in os.environ:
+            os.environ[key] = strip_env_quotes(value.strip())
+
+
+def strip_env_quotes(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return value[1:-1]
+    return value
+
+
+def build_notion_setup_text() -> str:
+    return f"""Notion access is not set up for notion-cli.
+
+This CLI uses the official Notion API with an internal integration token stored
+outside the repository. Notion still requires each target page, database, or
+wiki area to be shared with the integration before the API can read or edit it.
+
+1. Create the internal integration:
+
+- Open https://www.notion.so/my-integrations.
+- Create a new internal integration in the correct workspace.
+- Give it a clear name such as "Local Notion CLI".
+- Copy the internal integration secret. The token should start with ntn_.
+
+2. Enable the capabilities this CLI needs:
+
+{build_notion_capabilities_text().rstrip()}
+
+3. Share content with the integration:
+
+- Open the target page or database in Notion.
+- Use Share, Connections, or Add connections.
+- Add the internal integration to that page or database.
+- Repeat this for each page, database, or parent area the CLI must access.
+- If the API returns restricted_resource or HTTP 403, the token is usually valid
+  but the integration was not shared with the target content or lacks a needed
+  capability.
+
+{build_notion_env_setup_text().rstrip()}
+
+{build_notion_oauth_note_text().rstrip()}
+
+Reference docs:
+- Authorization: https://developers.notion.com/docs/authorization
+- Create an integration: https://developers.notion.com/docs/create-a-notion-integration
+- Authentication: https://developers.notion.com/reference/authentication
+- Capabilities: https://developers.notion.com/reference/capabilities
+"""
+
+
+def build_notion_capabilities_text() -> str:
+    return """For broad CLI use, enable these Notion integration capabilities:
+
+- Read content: required for search, page export, block reads, and data-source queries.
+- Insert content: required for creating pages, appending blocks, and creating comments.
+- Update content: required for page updates, block updates, trash/restore, and schema updates.
+- Read comments: required for listing or reading comments.
+- Insert comments: required for creating or updating comments.
+- Read user information: required for user list/user lookup commands.
+
+Use a smaller capability set only if the intended CLI use is intentionally read-only or otherwise constrained."""
+
+
+def build_notion_env_setup_text() -> str:
+    return """4. Store the token outside this repository:
+
+```sh
+mkdir -p ~/.notion
+chmod 700 ~/.notion
+$EDITOR ~/.notion/env
+chmod 600 ~/.notion/env
+```
+
+Put this in ~/.notion/env:
+
+```sh
+NOTION_TOKEN=ntn_your_token_here
+```
+
+Then verify access:
+
+```sh
+uv run scripts/notion-cli me
+```
+"""
+
+
+def build_notion_oauth_note_text() -> str:
+    return """OAuth note:
+
+Use a public OAuth integration only when this CLI is being adapted into an app
+that needs to install into other users' workspaces. This local CLI does not
+implement an OAuth callback or token exchange flow. For local agent work, use
+an internal integration token in ~/.notion/env."""
+
+
+def is_auth_setup_error(error: NotionError) -> bool:
+    return error.status in AUTH_SETUP_STATUSES or (error.code or "") in AUTH_SETUP_CODES
+
+
+def read_json_arg(value: str) -> Any:
+    if value == "-":
+        return json.loads(sys.stdin.read())
+    if value.startswith("@"):
+        return json.loads(Path(value[1:]).expanduser().read_text(encoding="utf-8"))
+    return json.loads(value)
+
+
+def add_query_params(path: str, pairs: list[str]) -> str:
+    if not pairs:
+        return path
+
+    parsed = list(query_pairs_to_dict(pairs).items())
+    separator = "&" if "?" in path else "?"
+    return f"{path}{separator}{urllib.parse.urlencode(parsed)}"
+
+
+def query_pairs_to_dict(pairs: list[str]) -> dict[str, str]:
+    parsed: dict[str, str] = {}
+    for pair in pairs:
+        key, separator, value = pair.partition("=")
+        if not separator:
+            raise ValueError(f"Invalid --query value {pair!r}; expected key=value.")
+        parsed[key] = value
+    return parsed
+
+
+def split_path_query(path: str) -> tuple[str, dict[str, str]]:
+    base, separator, query = path.partition("?")
+    if not separator:
+        return path, {}
+    return base, dict(urllib.parse.parse_qsl(query, keep_blank_values=True))
+
+
+def emit_json(value: Any) -> None:
+    print(to_json(value))
+
+
+def to_json(value: Any) -> str:
+    return json.dumps(value, indent=2, ensure_ascii=False)
+
+
+def parse_notion_id(value: str) -> str:
+    compact = re.search(r"[0-9a-fA-F]{32}", value)
+    if compact:
+        raw = compact.group(0)
+        return f"{raw[0:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:32]}"
+
+    dashed = re.search(
+        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+        value,
+    )
+    if dashed:
+        return dashed.group(0)
+
+    raise ValueError(f"Could not find a Notion UUID in: {value}")
+
+
+def output_path(base: Path, suffix: str) -> Path:
+    return base.parent / f"{base.name}{suffix}"
+
+
+def text_object(content: str) -> dict[str, Any]:
+    return {"type": "text", "text": {"content": content}}
+
+
+def rich_text_array(content: str) -> list[dict[str, Any]]:
+    return [text_object(content)] if content else []
+
+
+def title_property(title: str) -> dict[str, Any]:
+    return {"title": rich_text_array(title)}
+
+
+def build_page_create_body(args: argparse.Namespace) -> dict[str, Any]:
+    body: dict[str, Any] = {}
+    if args.parent_page:
+        body["parent"] = {"page_id": parse_notion_id(args.parent_page)}
+    elif args.parent_data_source:
+        body["parent"] = {"data_source_id": parse_notion_id(args.parent_data_source)}
+    elif args.workspace:
+        body["parent"] = {"workspace": True}
+    else:
+        raise ValueError("Provide --parent-page, --parent-data-source, --workspace, or --body.")
+
+    properties = read_json_arg(args.properties) if args.properties else {}
+    if args.title:
+        properties[args.title_property] = title_property(args.title)
+    if properties:
+        body["properties"] = properties
+
+    children = build_children_from_args(args, required=False)
+    if children:
+        body["children"] = children
+
+    return body
+
+
+def build_children_from_args(args: argparse.Namespace, required: bool = True) -> list[dict[str, Any]]:
+    if getattr(args, "children", None):
+        children = read_json_arg(args.children)
+        if not isinstance(children, list):
+            raise ValueError("--children must decode to a JSON array.")
+        return children
+
+    markdown = None
+    if getattr(args, "markdown", None) is not None:
+        markdown = args.markdown
+    elif getattr(args, "markdown_file", None):
+        markdown = Path(args.markdown_file).expanduser().read_text(encoding="utf-8")
+
+    if markdown is not None:
+        return markdown_to_blocks(markdown)
+    if required:
+        raise ValueError("Provide --body, --children, --markdown, or --markdown-file.")
+    return []
+
+
+def build_block_update_body(block_type: str, text: str | None, checked: str | None) -> dict[str, Any]:
+    block: dict[str, Any] = {}
+    if text is not None:
+        if block_type == "code":
+            block["rich_text"] = rich_text_array(text)
+            block.setdefault("language", "plain text")
+        else:
+            block["rich_text"] = rich_text_array(text)
+    if checked is not None:
+        if block_type != "to_do":
+            raise ValueError("--checked can only be used with --type to_do.")
+        block["checked"] = checked == "true"
+    return {block_type: block}
+
+
+def comment_body(args: argparse.Namespace) -> dict[str, Any]:
+    values = [args.text is not None, args.markdown is not None, args.markdown_file is not None]
+    if sum(values) != 1:
+        raise ValueError("Provide exactly one of --text, --markdown, or --markdown-file.")
+    if args.text is not None:
+        return {"rich_text": rich_text_array(args.text)}
+    if args.markdown_file:
+        return {"markdown": Path(args.markdown_file).expanduser().read_text(encoding="utf-8")}
+    return {"markdown": args.markdown}
+
+
+def list_block_children(
+    client: NotionClient,
+    block_id: str,
+    recursive: bool = True,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    results = client.collect_paginated_get(f"/blocks/{block_id}/children", limit=limit)
+    if recursive:
+        for block in results:
+            if block.get("has_children"):
+                block["children"] = list_block_children(client, block["id"], recursive=True)
+    return results
+
+
+def markdown_to_blocks(markdown: str) -> list[dict[str, Any]]:
+    blocks: list[dict[str, Any]] = []
+    code_lines: list[str] | None = None
+    code_language = "plain text"
+
+    for raw_line in markdown.splitlines():
+        line = raw_line.rstrip()
+
+        if code_lines is not None:
+            if line.startswith("```"):
+                blocks.append(code_block("\n".join(code_lines), code_language))
+                code_lines = None
+                code_language = "plain text"
+            else:
+                code_lines.append(line)
+            continue
+
+        if line.startswith("```"):
+            code_language = line[3:].strip() or "plain text"
+            code_lines = []
+            continue
+
+        if not line.strip():
+            continue
+        if line == "---":
+            blocks.append({"object": "block", "type": "divider", "divider": {}})
+            continue
+
+        heading_match = re.match(r"^(#{1,3})\s+(.+)$", line)
+        if heading_match:
+            level = len(heading_match.group(1))
+            block_type = f"heading_{level}"
+            blocks.append(rich_text_block(block_type, heading_match.group(2)))
+            continue
+
+        todo_match = re.match(r"^- \[([ xX])\]\s+(.+)$", line)
+        if todo_match:
+            blocks.append(
+                {
+                    "object": "block",
+                    "type": "to_do",
+                    "to_do": {
+                        "rich_text": rich_text_array(todo_match.group(2)),
+                        "checked": todo_match.group(1).lower() == "x",
+                    },
+                }
+            )
+            continue
+
+        bullet_match = re.match(r"^[-*]\s+(.+)$", line)
+        if bullet_match:
+            blocks.append(rich_text_block("bulleted_list_item", bullet_match.group(1)))
+            continue
+
+        number_match = re.match(r"^\d+[.)]\s+(.+)$", line)
+        if number_match:
+            blocks.append(rich_text_block("numbered_list_item", number_match.group(1)))
+            continue
+
+        quote_match = re.match(r"^>\s+(.+)$", line)
+        if quote_match:
+            blocks.append(rich_text_block("quote", quote_match.group(1)))
+            continue
+
+        blocks.append(rich_text_block("paragraph", line))
+
+    if code_lines is not None:
+        blocks.append(code_block("\n".join(code_lines), code_language))
+
+    return blocks
+
+
+def rich_text_block(block_type: str, content: str) -> dict[str, Any]:
+    return {"object": "block", "type": block_type, block_type: {"rich_text": rich_text_array(content)}}
+
+
+def code_block(content: str, language: str) -> dict[str, Any]:
+    return {
+        "object": "block",
+        "type": "code",
+        "code": {"rich_text": rich_text_array(content), "language": language},
+    }
+
+
+def rich_text(items: list[dict[str, Any]] | None) -> str:
+    parts = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        text_data = item.get("text") or {}
+        link_data = text_data.get("link") or {}
+        text = item.get("plain_text", "")
+        href = item.get("href") or link_data.get("url")
+
+        if item.get("type") == "mention" and not text:
+            mention = item.get("mention") or {}
+            text = (mention.get("page") or {}).get("id") or (mention.get("database") or {}).get("id") or ""
+
+        annotations = item.get("annotations", {})
+        if annotations.get("code"):
+            text = f"`{text}`"
+        if annotations.get("bold"):
+            text = f"**{text}**"
+        if annotations.get("italic"):
+            text = f"_{text}_"
+        if annotations.get("strikethrough"):
+            text = f"~~{text}~~"
+        if href:
+            text = f"[{text}]({href})"
+
+        parts.append(text)
+    return "".join(parts)
+
+
+def page_title(page: dict[str, Any]) -> str:
+    for prop in page.get("properties", {}).values():
+        if prop.get("type") == "title":
+            title = rich_text(prop.get("title"))
+            if title:
+                return title
+    return page.get("id", "Untitled")
+
+
+def object_title(obj: dict[str, Any]) -> str:
+    if obj.get("object") == "page":
+        return page_title(obj)
+    title = rich_text(obj.get("title"))
+    if title:
+        return title
+    return obj.get("name") or obj.get("id", "")
+
+
+def indent_lines(text: str, prefix: str) -> str:
+    return "\n".join(f"{prefix}{line}" if line else line for line in text.splitlines())
+
+
+def render_children(block: dict[str, Any], depth: int) -> str:
+    children = block.get("children") or []
+    if not children:
+        return ""
+    return "\n" + blocks_to_markdown(children, depth + 1)
+
+
+def file_url(data: dict[str, Any]) -> str:
+    return data.get("external", {}).get("url") or data.get("file", {}).get("url") or ""
+
+
+def block_to_markdown(block: dict[str, Any], depth: int = 0, index: int = 1) -> str:
+    block_type = block.get("type")
+    data = block.get(block_type, {}) if block_type else {}
+    children = render_children(block, depth)
+    pad = "  " * depth
+
+    if block_type == "paragraph":
+        text = rich_text(data.get("rich_text"))
+        return f"{pad}{text}{children}" if text else children.rstrip()
+    if block_type == "heading_1":
+        return f"# {rich_text(data.get('rich_text'))}{children}"
+    if block_type == "heading_2":
+        return f"## {rich_text(data.get('rich_text'))}{children}"
+    if block_type == "heading_3":
+        return f"### {rich_text(data.get('rich_text'))}{children}"
+    if block_type == "heading_4":
+        return f"#### {rich_text(data.get('rich_text'))}{children}"
+    if block_type == "bulleted_list_item":
+        nested = f"\n{indent_lines(children.rstrip(), '  ')}" if children else ""
+        return f"{pad}- {rich_text(data.get('rich_text'))}{nested}"
+    if block_type == "numbered_list_item":
+        nested = f"\n{indent_lines(children.rstrip(), '   ')}" if children else ""
+        return f"{pad}{index}. {rich_text(data.get('rich_text'))}{nested}"
+    if block_type == "to_do":
+        checked = "x" if data.get("checked") else " "
+        return f"{pad}- [{checked}] {rich_text(data.get('rich_text'))}{children}"
+    if block_type == "toggle":
+        return f"{pad}<details><summary>{rich_text(data.get('rich_text'))}</summary>\n{children.strip()}\n</details>"
+    if block_type == "quote":
+        nested = f"\n{indent_lines(children.rstrip(), '> ')}" if children else ""
+        return f"{pad}> {rich_text(data.get('rich_text'))}{nested}"
+    if block_type == "callout":
+        icon = f"{data.get('icon', {}).get('emoji')} " if data.get("icon", {}).get("emoji") else ""
+        nested = f"\n{indent_lines(children.rstrip(), '> ')}" if children else ""
+        return f"{pad}> {icon}{rich_text(data.get('rich_text'))}{nested}"
+    if block_type == "code":
+        language = data.get("language", "")
+        return f"{pad}```{language}\n{rich_text(data.get('rich_text'))}\n{pad}```"
+    if block_type == "equation":
+        return f"{pad}$${data.get('expression', '')}$$"
+    if block_type == "divider":
+        return f"{pad}---"
+    if block_type == "image":
+        caption = rich_text(data.get("caption")) or "image"
+        return f"{pad}![{caption}]({file_url(data)})"
+    if block_type in ("file", "pdf", "video", "audio"):
+        caption = rich_text(data.get("caption")) or data.get("name") or block_type
+        return f"{pad}[{caption}]({file_url(data)})"
+    if block_type in ("bookmark", "embed", "link_preview"):
+        return f"{pad}{data.get('url', '')}"
+    if block_type == "child_page":
+        return f"{pad}- {data.get('title', 'Untitled child page')}{children}"
+    if block_type == "child_database":
+        return f"{pad}- Database: {data.get('title') or block.get('id')}"
+    if block_type in ("table", "column_list", "column", "synced_block"):
+        return children.rstrip()
+    if block_type == "table_row":
+        cells = " | ".join(rich_text(cell) for cell in data.get("cells", []))
+        return f"{pad}| {cells} |"
+    if block_type == "unsupported":
+        return f"{pad}> Unsupported Notion block: {block.get('id')}"
+
+    text = rich_text(data.get("rich_text"))
+    return f"{pad}{text or f'Unsupported block type: {block_type}'}{children}"
+
+
+def blocks_to_markdown(blocks: list[dict[str, Any]], depth: int = 0) -> str:
+    rendered = []
+    numbered_index = 1
+
+    for block in blocks:
+        if block.get("type") == "numbered_list_item":
+            rendered.append(block_to_markdown(block, depth, numbered_index))
+            numbered_index += 1
+        else:
+            numbered_index = 1
+            rendered.append(block_to_markdown(block, depth))
+
+    return "\n\n".join(item for item in rendered if item)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
