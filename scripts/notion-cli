@@ -35,6 +35,19 @@ AUTH_SETUP_CODES = {
 RICH_TEXT_CHAR_LIMIT = 2000
 BLOCK_CHILDREN_LIMIT = 100
 
+# Inline markdown: bold, italic, code, links (non-greedy, ordered longest-first)
+_INLINE_RE = re.compile(
+    r"\*\*(.+?)\*\*"
+    r"|__(.+?)__"
+    r"|\*(.+?)\*"
+    r"|_(.+?)_"
+    r"|`(.+?)`"
+    r"|\[(.+?)\]\(([^)]+)\)",
+    re.DOTALL,
+)
+# Leading emoji: covers Supplemental Multilingual Plane + common BMP symbol blocks
+_EMOJI_RE = re.compile(r"^([\U0001F000-\U0001FFFF☀-➿⌀-⏿⭐⭕])\s*(.*)", re.DOTALL)
+
 
 class NotionError(RuntimeError):
     def __init__(self, status: int, reason: str, message: str, code: str | None = None) -> None:
@@ -973,6 +986,12 @@ def markdown_to_blocks(markdown: str) -> list[dict[str, Any]]:
     blocks: list[dict[str, Any]] = []
     code_lines: list[str] | None = None
     code_language = "plain text"
+    table_lines: list[str] = []
+
+    def flush_table() -> None:
+        if table_lines:
+            blocks.append(build_table_block(list(table_lines)))
+            table_lines.clear()
 
     for raw_line in markdown.splitlines():
         line = raw_line.rstrip()
@@ -987,9 +1006,16 @@ def markdown_to_blocks(markdown: str) -> list[dict[str, Any]]:
             continue
 
         if line.startswith("```"):
+            flush_table()
             code_language = line[3:].strip() or "plain text"
             code_lines = []
             continue
+
+        if line.startswith("|"):
+            table_lines.append(line)
+            continue
+
+        flush_table()
 
         if not line.strip():
             continue
@@ -1011,7 +1037,7 @@ def markdown_to_blocks(markdown: str) -> list[dict[str, Any]]:
                     "object": "block",
                     "type": "to_do",
                     "to_do": {
-                        "rich_text": rich_text_array(todo_match.group(2)),
+                        "rich_text": parse_inline_markdown(todo_match.group(2)),
                         "checked": todo_match.group(1).lower() == "x",
                     },
                 }
@@ -1030,19 +1056,85 @@ def markdown_to_blocks(markdown: str) -> list[dict[str, Any]]:
 
         quote_match = re.match(r"^>\s+(.+)$", line)
         if quote_match:
-            blocks.append(rich_text_block("quote", quote_match.group(1)))
+            content = quote_match.group(1)
+            emoji_match = _EMOJI_RE.match(content)
+            if emoji_match:
+                blocks.append({
+                    "object": "block",
+                    "type": "callout",
+                    "callout": {
+                        "rich_text": parse_inline_markdown(emoji_match.group(2)),
+                        "icon": {"type": "emoji", "emoji": emoji_match.group(1)},
+                    },
+                })
+            else:
+                blocks.append(rich_text_block("quote", content))
             continue
 
         blocks.append(rich_text_block("paragraph", line))
 
+    flush_table()
     if code_lines is not None:
         blocks.append(code_block("\n".join(code_lines), code_language))
 
     return blocks
 
 
+def parse_inline_markdown(text: str) -> list[dict[str, Any]]:
+    """Convert inline markdown (bold, italic, code, links) to Notion rich_text objects."""
+    parts: list[dict[str, Any]] = []
+    last = 0
+    for m in _INLINE_RE.finditer(text):
+        if m.start() > last:
+            parts.extend(rich_text_array(text[last : m.start()]))
+        bold1, bold2, ital1, ital2, code, link_text, link_url = m.groups()
+        if bold1 or bold2:
+            raw = bold1 or bold2
+            for chunk in (raw[i : i + RICH_TEXT_CHAR_LIMIT] for i in range(0, max(1, len(raw)), RICH_TEXT_CHAR_LIMIT)):
+                parts.append({"type": "text", "text": {"content": chunk}, "annotations": {"bold": True}})
+        elif ital1 or ital2:
+            raw = ital1 or ital2
+            for chunk in (raw[i : i + RICH_TEXT_CHAR_LIMIT] for i in range(0, max(1, len(raw)), RICH_TEXT_CHAR_LIMIT)):
+                parts.append({"type": "text", "text": {"content": chunk}, "annotations": {"italic": True}})
+        elif code:
+            for chunk in (code[i : i + RICH_TEXT_CHAR_LIMIT] for i in range(0, max(1, len(code)), RICH_TEXT_CHAR_LIMIT)):
+                parts.append({"type": "text", "text": {"content": chunk}, "annotations": {"code": True}})
+        elif link_text is not None:
+            parts.append({"type": "text", "text": {"content": link_text, "link": {"url": link_url}}})
+        last = m.end()
+    if last < len(text):
+        parts.extend(rich_text_array(text[last:]))
+    return parts or rich_text_array(text)
+
+
+def build_table_block(lines: list[str]) -> dict[str, Any]:
+    """Convert GFM pipe-table lines into a Notion table block with nested table_row children."""
+    rows: list[list[str]] = []
+    has_header = False
+    for line in lines:
+        if re.match(r"^\|[\s\-|:]+\|$", line):
+            has_header = True
+            continue
+        cells = [c.strip() for c in line.strip("|").split("|")]
+        rows.append(cells)
+    width = max((len(r) for r in rows), default=0)
+    return {
+        "object": "block",
+        "type": "table",
+        "table": {"table_width": width, "has_column_header": has_header, "has_row_header": False},
+        "children": [
+            {
+                "object": "block",
+                "type": "table_row",
+                "table_row": {"cells": [parse_inline_markdown(c) for c in row]},
+            }
+            for row in rows
+        ],
+    }
+
+
 def rich_text_block(block_type: str, content: str) -> dict[str, Any]:
-    return {"object": "block", "type": block_type, block_type: {"rich_text": rich_text_array(content)}}
+    return {"object": "block", "type": block_type, block_type: {"rich_text": parse_inline_markdown(content)}}
 
 
 def code_block(content: str, language: str) -> dict[str, Any]:
