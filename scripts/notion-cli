@@ -32,6 +32,9 @@ AUTH_SETUP_CODES = {
     "unauthorized",
 }
 
+RICH_TEXT_CHAR_LIMIT = 2000
+BLOCK_CHILDREN_LIMIT = 100
+
 
 class NotionError(RuntimeError):
     def __init__(self, status: int, reason: str, message: str, code: str | None = None) -> None:
@@ -496,7 +499,14 @@ def cmd_page_export(client: NotionClient, args: argparse.Namespace) -> int:
 
 def cmd_page_create(client: NotionClient, args: argparse.Namespace) -> int:
     body = read_json_arg(args.body) if args.body else build_page_create_body(args)
-    emit_json(client.post("/pages", body))
+    children = body.pop("children", [])
+    if children:
+        body["children"] = children[:BLOCK_CHILDREN_LIMIT]
+    page = client.post("/pages", body)
+    overflow = children[BLOCK_CHILDREN_LIMIT:]
+    if overflow:
+        append_blocks_batched(client, page["id"], overflow)
+    emit_json(page)
     return 0
 
 
@@ -552,8 +562,16 @@ def cmd_block_children(client: NotionClient, args: argparse.Namespace) -> int:
 
 
 def cmd_block_append(client: NotionClient, args: argparse.Namespace) -> int:
-    body = read_json_arg(args.body) if args.body else {"children": build_children_from_args(args)}
-    emit_json(client.patch(f"/blocks/{parse_notion_id(args.block)}/children", body))
+    block_id = parse_notion_id(args.block)
+    if args.body:
+        body = read_json_arg(args.body)
+        children = body.get("children")
+        if children is None:
+            emit_json(client.patch(f"/blocks/{block_id}/children", body))
+        else:
+            emit_json(append_blocks_batched(client, block_id, children))
+    else:
+        emit_json(append_blocks_batched(client, block_id, build_children_from_args(args)))
     return 0
 
 
@@ -847,7 +865,9 @@ def text_object(content: str) -> dict[str, Any]:
 
 
 def rich_text_array(content: str) -> list[dict[str, Any]]:
-    return [text_object(content)] if content else []
+    if not content:
+        return []
+    return [text_object(content[i : i + RICH_TEXT_CHAR_LIMIT]) for i in range(0, len(content), RICH_TEXT_CHAR_LIMIT)]
 
 
 def title_property(title: str) -> dict[str, Any]:
@@ -922,6 +942,17 @@ def comment_body(args: argparse.Namespace) -> dict[str, Any]:
     if args.markdown_file:
         return {"markdown": Path(args.markdown_file).expanduser().read_text(encoding="utf-8")}
     return {"markdown": args.markdown}
+
+
+def append_blocks_batched(client: NotionClient, block_id: str, children: list[dict[str, Any]]) -> dict[str, Any]:
+    """Append children in batches of BLOCK_CHILDREN_LIMIT to respect the Notion API limit."""
+    if not children:
+        return {"object": "list", "results": [], "type": "block", "block": {}}
+    all_results: list[dict[str, Any]] = []
+    for i in range(0, len(children), BLOCK_CHILDREN_LIMIT):
+        response = client.patch(f"/blocks/{block_id}/children", {"children": children[i : i + BLOCK_CHILDREN_LIMIT]})
+        all_results.extend(response.get("results", []))
+    return {"object": "list", "results": all_results, "type": "block", "block": {}}
 
 
 def list_block_children(
