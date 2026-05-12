@@ -31,22 +31,13 @@ AUTH_SETUP_CODES = {
     "restricted_resource",
     "unauthorized",
 }
-
-RICH_TEXT_CHAR_LIMIT = 2000
-BLOCK_CHILDREN_LIMIT = 100
-
-# Inline markdown: bold, italic, code, links (non-greedy, ordered longest-first)
-_INLINE_RE = re.compile(
-    r"\*\*(.+?)\*\*"
-    r"|__(.+?)__"
-    r"|\*(.+?)\*"
-    r"|_(.+?)_"
-    r"|`(.+?)`"
-    r"|\[(.+?)\]\(([^)]+)\)",
-    re.DOTALL,
-)
-# Leading emoji: covers Supplemental Multilingual Plane + common BMP symbol blocks
-_EMOJI_RE = re.compile(r"^([\U0001F000-\U0001FFFF☀-➿⌀-⏿⭐⭕])\s*(.*)", re.DOTALL)
+EXIT_RUNTIME = 1
+EXIT_USAGE = 2
+EXIT_AUTH = 3
+EXIT_PERMISSION = 4
+EXIT_DOMAIN = 5
+OUTPUT_FORMAT = "human"
+STARTED_AT = time.perf_counter()
 
 
 class NotionError(RuntimeError):
@@ -170,33 +161,42 @@ class NotionClient:
 
 
 def main() -> int:
+    global OUTPUT_FORMAT, STARTED_AT
+    STARTED_AT = time.perf_counter()
     args = build_parser().parse_args()
+    OUTPUT_FORMAT = args.output
 
     try:
+        if args.schema:
+            emit_json(build_schema())
+            return 0
+        if not hasattr(args, "func"):
+            build_parser().print_usage(sys.stderr)
+            return EXIT_USAGE
         if not getattr(args, "requires_auth", True):
             return args.func(None, args)
 
         load_env_files([Path(path).expanduser() for path in args.env_file] if args.env_file else NOTION_ENV_FILES)
         token = os.environ.get("NOTION_TOKEN") or os.environ.get("NOTION_API_KEY") or os.environ.get("NTN_TOKEN")
         if not token:
-            print(build_notion_setup_text(), file=sys.stdout, flush=True)
-            return 1
+            return emit_error("missing_credentials", "Notion credentials are not configured.", EXIT_AUTH, setup_text=build_notion_setup_text())
 
         client = NotionClient(token=token, notion_version=args.notion_version)
         return args.func(client, args)
     except (NotionError, RuntimeError, ValueError, OSError, json.JSONDecodeError) as error:
         if isinstance(error, NotionError) and is_auth_setup_error(error):
-            print(str(error), file=sys.stderr, flush=True)
-            print(build_notion_setup_text(), file=sys.stdout, flush=True)
-            return 1
-        print(str(error), file=sys.stderr, flush=True)
-        return 1
+            exit_code = EXIT_PERMISSION if error.code == "restricted_resource" else EXIT_AUTH
+            return emit_error(error.code or "auth_error", str(error), exit_code, setup_text=build_notion_setup_text())
+        return emit_error("runtime_error", str(error), EXIT_RUNTIME)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="notion-cli",
-        description="Single-file Notion API CLI using ~/.notion/env credentials.",
+        description=(
+            "Single-file Notion API CLI using ~/.notion/env credentials. "
+            "Exit codes: 0 success, 1 runtime/API, 2 usage, 3 auth, 4 permission, 5 domain."
+        ),
     )
     parser.add_argument(
         "--notion-version",
@@ -208,12 +208,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         help="Credential env file to load. Defaults to ~/.notion/env and compatible fallbacks.",
     )
+    parser.add_argument("--output", choices=["human", "json"], default="human", help="Output format. JSON mode emits one envelope object.")
+    parser.add_argument("--schema", action="store_true", help="Print machine-readable command schema as JSON.")
 
-    subparsers = parser.add_subparsers(required=True)
+    subparsers = parser.add_subparsers()
 
     add_setup_parser(subparsers)
     add_me_parser(subparsers)
     add_api_parser(subparsers)
+    add_schema_parser(subparsers)
     add_search_parser(subparsers)
     add_page_parser(subparsers)
     add_block_parser(subparsers)
@@ -247,6 +250,11 @@ def add_api_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParse
     parser.add_argument("--query", action="append", default=[], help="Append query params as key=value.")
     parser.add_argument("--paginate", action="store_true", help="Collect paginated list results.")
     parser.set_defaults(func=cmd_api)
+
+
+def add_schema_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    parser = subparsers.add_parser("schema", help="Print machine-readable command schema.")
+    parser.set_defaults(func=cmd_schema, requires_auth=False)
 
 
 def add_search_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -433,13 +441,17 @@ def add_user_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
 
 def cmd_setup(_client: NotionClient | None, args: argparse.Namespace) -> int:
     if args.env_only:
-        print(build_notion_env_setup_text().rstrip(), flush=True)
+        text = build_notion_env_setup_text().rstrip()
     elif args.capabilities_only:
-        print(build_notion_capabilities_text().rstrip(), flush=True)
+        text = build_notion_capabilities_text().rstrip()
     elif args.oauth_note:
-        print(build_notion_oauth_note_text().rstrip(), flush=True)
+        text = build_notion_oauth_note_text().rstrip()
     else:
-        print(build_notion_setup_text().rstrip(), flush=True)
+        text = build_notion_setup_text().rstrip()
+    if OUTPUT_FORMAT == "json":
+        emit_json({"text": text})
+    else:
+        print(text, flush=True)
     return 0
 
 
@@ -468,6 +480,11 @@ def cmd_api(client: NotionClient, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_schema(_client: NotionClient | None, _args: argparse.Namespace) -> int:
+    emit_json(build_schema())
+    return 0
+
+
 def cmd_search(client: NotionClient, args: argparse.Namespace) -> int:
     body: dict[str, Any] = {
         "query": args.query,
@@ -477,7 +494,7 @@ def cmd_search(client: NotionClient, args: argparse.Namespace) -> int:
         body["filter"] = {"property": "object", "value": args.object}
 
     results = client.collect_paginated_post("/search", body, limit=args.limit)
-    if args.json:
+    if args.json or OUTPUT_FORMAT == "json":
         emit_json(results)
     else:
         for item in results:
@@ -501,25 +518,22 @@ def cmd_page_export(client: NotionClient, args: argparse.Namespace) -> int:
     out_base = Path(args.output_base)
     markdown_path = output_path(out_base, ".md")
     markdown_path.write_text(markdown, encoding="utf-8")
-    print(f"Wrote {markdown_path}", flush=True)
+    print(f"Wrote {markdown_path}", file=sys.stderr, flush=True)
 
+    written = {"markdown": str(markdown_path)}
     if not args.no_json:
         json_path = output_path(out_base, ".json")
         json_path.write_text(to_json({"page": page, "blocks": blocks}), encoding="utf-8")
-        print(f"Wrote {json_path}", flush=True)
+        written["json"] = str(json_path)
+        print(f"Wrote {json_path}", file=sys.stderr, flush=True)
+    if OUTPUT_FORMAT == "json":
+        emit_json({"page_id": page_id, "title": title, "written": written, "block_count": len(blocks)})
     return 0
 
 
 def cmd_page_create(client: NotionClient, args: argparse.Namespace) -> int:
     body = read_json_arg(args.body) if args.body else build_page_create_body(args)
-    children = body.pop("children", [])
-    if children:
-        body["children"] = children[:BLOCK_CHILDREN_LIMIT]
-    page = client.post("/pages", body)
-    overflow = children[BLOCK_CHILDREN_LIMIT:]
-    if overflow:
-        append_blocks_batched(client, page["id"], overflow)
-    emit_json(page)
+    emit_json(client.post("/pages", body))
     return 0
 
 
@@ -575,16 +589,8 @@ def cmd_block_children(client: NotionClient, args: argparse.Namespace) -> int:
 
 
 def cmd_block_append(client: NotionClient, args: argparse.Namespace) -> int:
-    block_id = parse_notion_id(args.block)
-    if args.body:
-        body = read_json_arg(args.body)
-        children = body.get("children")
-        if children is None:
-            emit_json(client.patch(f"/blocks/{block_id}/children", body))
-        else:
-            emit_json(append_blocks_batched(client, block_id, children))
-    else:
-        emit_json(append_blocks_batched(client, block_id, build_children_from_args(args)))
+    body = read_json_arg(args.body) if args.body else {"children": build_children_from_args(args)}
+    emit_json(client.patch(f"/blocks/{parse_notion_id(args.block)}/children", body))
     return 0
 
 
@@ -846,11 +852,85 @@ def split_path_query(path: str) -> tuple[str, dict[str, str]]:
 
 
 def emit_json(value: Any) -> None:
-    print(to_json(value), flush=True)
+    if OUTPUT_FORMAT == "json":
+        payload = {
+            "status": "success",
+            "metadata": {"execution_time_ms": elapsed_ms(), "records_processed": count_records(value)},
+            "data": value,
+        }
+        print(to_json(payload), flush=True)
+    else:
+        print(to_json(value), flush=True)
 
 
 def to_json(value: Any) -> str:
     return json.dumps(value, indent=2, ensure_ascii=False)
+
+
+def emit_error(code: str, message: str, exit_code: int, *, retryable: bool = False, setup_text: str | None = None) -> int:
+    if setup_text:
+        print(setup_text, file=sys.stderr, flush=True)
+    if OUTPUT_FORMAT == "json":
+        payload = {
+            "status": "error",
+            "metadata": {"execution_time_ms": elapsed_ms()},
+            "error": {"code": code, "message": message, "retryable": retryable},
+        }
+        print(to_json(payload), flush=True)
+    else:
+        print(message, file=sys.stderr, flush=True)
+    return exit_code
+
+
+def elapsed_ms() -> int:
+    return int((time.perf_counter() - STARTED_AT) * 1000)
+
+
+def count_records(value: Any) -> int:
+    if isinstance(value, list):
+        return len(value)
+    if isinstance(value, dict):
+        for key in ("results", "items", "files", "messages", "data", "blocks"):
+            item = value.get(key)
+            if isinstance(item, list):
+                return len(item)
+        return 1
+    return 1 if value is not None else 0
+
+
+def build_schema() -> dict[str, Any]:
+    return {
+        "tool": "notion-cli",
+        "output": {
+            "formats": ["human", "json"],
+            "default": "human",
+            "json_envelope": {"status": "success|error", "metadata": "object", "data": "any", "error": "object"},
+        },
+        "credentials": {
+            "env_files": [str(path) for path in NOTION_ENV_FILES],
+            "token_env_vars": ["NOTION_TOKEN", "NOTION_API_KEY", "NTN_TOKEN"],
+        },
+        "exit_codes": {
+            "0": "success",
+            "1": "runtime/API/network/fatal error",
+            "2": "CLI syntax or argument error",
+            "3": "missing or invalid credentials",
+            "4": "permission denied or restricted resource",
+            "5": "validation, not found, conflict, or domain-specific failure",
+        },
+        "commands": {
+            "setup": {"auth": False, "args": ["--env-only", "--capabilities-only", "--oauth-note"]},
+            "me": {"auth": True},
+            "api": {"auth": True, "args": ["method", "path", "--data", "--query", "--paginate"]},
+            "search": {"auth": True, "args": ["query", "--object", "--limit", "--json"]},
+            "page": {"auth": True, "subcommands": ["get", "export", "create", "update", "delete", "restore"]},
+            "block": {"auth": True, "subcommands": ["get", "children", "append", "update", "delete"]},
+            "comment": {"auth": True, "subcommands": ["list", "get", "create", "update", "delete"]},
+            "database": {"auth": True, "subcommands": ["get", "create", "update"]},
+            "data-source": {"auth": True, "subcommands": ["get", "query", "create", "update"]},
+            "user": {"auth": True, "subcommands": ["get", "list"]},
+        },
+    }
 
 
 def parse_notion_id(value: str) -> str:
@@ -878,9 +958,7 @@ def text_object(content: str) -> dict[str, Any]:
 
 
 def rich_text_array(content: str) -> list[dict[str, Any]]:
-    if not content:
-        return []
-    return [text_object(content[i : i + RICH_TEXT_CHAR_LIMIT]) for i in range(0, len(content), RICH_TEXT_CHAR_LIMIT)]
+    return [text_object(content)] if content else []
 
 
 def title_property(title: str) -> dict[str, Any]:
@@ -957,17 +1035,6 @@ def comment_body(args: argparse.Namespace) -> dict[str, Any]:
     return {"markdown": args.markdown}
 
 
-def append_blocks_batched(client: NotionClient, block_id: str, children: list[dict[str, Any]]) -> dict[str, Any]:
-    """Append children in batches of BLOCK_CHILDREN_LIMIT to respect the Notion API limit."""
-    if not children:
-        return {"object": "list", "results": [], "type": "block", "block": {}}
-    all_results: list[dict[str, Any]] = []
-    for i in range(0, len(children), BLOCK_CHILDREN_LIMIT):
-        response = client.patch(f"/blocks/{block_id}/children", {"children": children[i : i + BLOCK_CHILDREN_LIMIT]})
-        all_results.extend(response.get("results", []))
-    return {"object": "list", "results": all_results, "type": "block", "block": {}}
-
-
 def list_block_children(
     client: NotionClient,
     block_id: str,
@@ -986,12 +1053,6 @@ def markdown_to_blocks(markdown: str) -> list[dict[str, Any]]:
     blocks: list[dict[str, Any]] = []
     code_lines: list[str] | None = None
     code_language = "plain text"
-    table_lines: list[str] = []
-
-    def flush_table() -> None:
-        if table_lines:
-            blocks.append(build_table_block(list(table_lines)))
-            table_lines.clear()
 
     for raw_line in markdown.splitlines():
         line = raw_line.rstrip()
@@ -1006,16 +1067,9 @@ def markdown_to_blocks(markdown: str) -> list[dict[str, Any]]:
             continue
 
         if line.startswith("```"):
-            flush_table()
             code_language = line[3:].strip() or "plain text"
             code_lines = []
             continue
-
-        if line.startswith("|"):
-            table_lines.append(line)
-            continue
-
-        flush_table()
 
         if not line.strip():
             continue
@@ -1037,7 +1091,7 @@ def markdown_to_blocks(markdown: str) -> list[dict[str, Any]]:
                     "object": "block",
                     "type": "to_do",
                     "to_do": {
-                        "rich_text": parse_inline_markdown(todo_match.group(2)),
+                        "rich_text": rich_text_array(todo_match.group(2)),
                         "checked": todo_match.group(1).lower() == "x",
                     },
                 }
@@ -1056,85 +1110,19 @@ def markdown_to_blocks(markdown: str) -> list[dict[str, Any]]:
 
         quote_match = re.match(r"^>\s+(.+)$", line)
         if quote_match:
-            content = quote_match.group(1)
-            emoji_match = _EMOJI_RE.match(content)
-            if emoji_match:
-                blocks.append({
-                    "object": "block",
-                    "type": "callout",
-                    "callout": {
-                        "rich_text": parse_inline_markdown(emoji_match.group(2)),
-                        "icon": {"type": "emoji", "emoji": emoji_match.group(1)},
-                    },
-                })
-            else:
-                blocks.append(rich_text_block("quote", content))
+            blocks.append(rich_text_block("quote", quote_match.group(1)))
             continue
 
         blocks.append(rich_text_block("paragraph", line))
 
-    flush_table()
     if code_lines is not None:
         blocks.append(code_block("\n".join(code_lines), code_language))
 
     return blocks
 
 
-def parse_inline_markdown(text: str) -> list[dict[str, Any]]:
-    """Convert inline markdown (bold, italic, code, links) to Notion rich_text objects."""
-    parts: list[dict[str, Any]] = []
-    last = 0
-    for m in _INLINE_RE.finditer(text):
-        if m.start() > last:
-            parts.extend(rich_text_array(text[last : m.start()]))
-        bold1, bold2, ital1, ital2, code, link_text, link_url = m.groups()
-        if bold1 or bold2:
-            raw = bold1 or bold2
-            for chunk in (raw[i : i + RICH_TEXT_CHAR_LIMIT] for i in range(0, max(1, len(raw)), RICH_TEXT_CHAR_LIMIT)):
-                parts.append({"type": "text", "text": {"content": chunk}, "annotations": {"bold": True}})
-        elif ital1 or ital2:
-            raw = ital1 or ital2
-            for chunk in (raw[i : i + RICH_TEXT_CHAR_LIMIT] for i in range(0, max(1, len(raw)), RICH_TEXT_CHAR_LIMIT)):
-                parts.append({"type": "text", "text": {"content": chunk}, "annotations": {"italic": True}})
-        elif code:
-            for chunk in (code[i : i + RICH_TEXT_CHAR_LIMIT] for i in range(0, max(1, len(code)), RICH_TEXT_CHAR_LIMIT)):
-                parts.append({"type": "text", "text": {"content": chunk}, "annotations": {"code": True}})
-        elif link_text is not None:
-            parts.append({"type": "text", "text": {"content": link_text, "link": {"url": link_url}}})
-        last = m.end()
-    if last < len(text):
-        parts.extend(rich_text_array(text[last:]))
-    return parts or rich_text_array(text)
-
-
-def build_table_block(lines: list[str]) -> dict[str, Any]:
-    """Convert GFM pipe-table lines into a Notion table block with nested table_row children."""
-    rows: list[list[str]] = []
-    has_header = False
-    for line in lines:
-        if re.match(r"^\|[\s\-|:]+\|$", line):
-            has_header = True
-            continue
-        cells = [c.strip() for c in line.strip("|").split("|")]
-        rows.append(cells)
-    width = max((len(r) for r in rows), default=0)
-    return {
-        "object": "block",
-        "type": "table",
-        "table": {"table_width": width, "has_column_header": has_header, "has_row_header": False},
-        "children": [
-            {
-                "object": "block",
-                "type": "table_row",
-                "table_row": {"cells": [parse_inline_markdown(c) for c in row]},
-            }
-            for row in rows
-        ],
-    }
-
-
 def rich_text_block(block_type: str, content: str) -> dict[str, Any]:
-    return {"object": "block", "type": block_type, block_type: {"rich_text": parse_inline_markdown(content)}}
+    return {"object": "block", "type": block_type, block_type: {"rich_text": rich_text_array(content)}}
 
 
 def code_block(content: str, language: str) -> dict[str, Any]:
