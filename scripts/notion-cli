@@ -179,17 +179,17 @@ def main() -> int:
         load_env_files([Path(path).expanduser() for path in args.env_file] if args.env_file else NOTION_ENV_FILES)
         token = os.environ.get("NOTION_TOKEN") or os.environ.get("NOTION_API_KEY") or os.environ.get("NTN_TOKEN")
         if not token:
-            print(build_notion_setup_text(), file=sys.stdout)
+            print(build_notion_setup_text(), file=sys.stdout, flush=True)
             return 1
 
         client = NotionClient(token=token, notion_version=args.notion_version)
         return args.func(client, args)
     except (NotionError, RuntimeError, ValueError, OSError, json.JSONDecodeError) as error:
         if isinstance(error, NotionError) and is_auth_setup_error(error):
-            print(str(error), file=sys.stderr)
-            print(build_notion_setup_text(), file=sys.stdout)
+            print(str(error), file=sys.stderr, flush=True)
+            print(build_notion_setup_text(), file=sys.stdout, flush=True)
             return 1
-        print(str(error), file=sys.stderr)
+        print(str(error), file=sys.stderr, flush=True)
         return 1
 
 
@@ -433,13 +433,13 @@ def add_user_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentPars
 
 def cmd_setup(_client: NotionClient | None, args: argparse.Namespace) -> int:
     if args.env_only:
-        print(build_notion_env_setup_text().rstrip())
+        print(build_notion_env_setup_text().rstrip(), flush=True)
     elif args.capabilities_only:
-        print(build_notion_capabilities_text().rstrip())
+        print(build_notion_capabilities_text().rstrip(), flush=True)
     elif args.oauth_note:
-        print(build_notion_oauth_note_text().rstrip())
+        print(build_notion_oauth_note_text().rstrip(), flush=True)
     else:
-        print(build_notion_setup_text().rstrip())
+        print(build_notion_setup_text().rstrip(), flush=True)
     return 0
 
 
@@ -482,7 +482,7 @@ def cmd_search(client: NotionClient, args: argparse.Namespace) -> int:
     else:
         for item in results:
             title = object_title(item)
-            print(f"{item.get('object')}\t{item.get('id')}\t{title}\t{item.get('url', '')}")
+            print(f"{item.get('object')}\t{item.get('id')}\t{title}\t{item.get('url', '')}", flush=True)
     return 0
 
 
@@ -501,12 +501,12 @@ def cmd_page_export(client: NotionClient, args: argparse.Namespace) -> int:
     out_base = Path(args.output_base)
     markdown_path = output_path(out_base, ".md")
     markdown_path.write_text(markdown, encoding="utf-8")
-    print(f"Wrote {markdown_path}")
+    print(f"Wrote {markdown_path}", flush=True)
 
     if not args.no_json:
         json_path = output_path(out_base, ".json")
         json_path.write_text(to_json({"page": page, "blocks": blocks}), encoding="utf-8")
-        print(f"Wrote {json_path}")
+        print(f"Wrote {json_path}", flush=True)
     return 0
 
 
@@ -568,7 +568,7 @@ def cmd_block_children(client: NotionClient, args: argparse.Namespace) -> int:
     block_id = parse_notion_id(args.block)
     blocks = list_block_children(client, block_id, recursive=args.recursive, limit=args.limit)
     if args.markdown:
-        print(blocks_to_markdown(blocks))
+        print(blocks_to_markdown(blocks), flush=True)
     else:
         emit_json(blocks)
     return 0
@@ -846,7 +846,7 @@ def split_path_query(path: str) -> tuple[str, dict[str, str]]:
 
 
 def emit_json(value: Any) -> None:
-    print(to_json(value))
+    print(to_json(value), flush=True)
 
 
 def to_json(value: Any) -> str:
