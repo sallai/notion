@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import mimetypes
 import os
 import re
 import sys
@@ -15,6 +16,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -133,6 +135,54 @@ class NotionClient:
                 return results
             cursor = response.get("next_cursor")
 
+    def upload_file(self, path: Path, filename: str | None = None, content_type: str | None = None) -> dict[str, Any]:
+        """Upload a local file to Notion via the two-step File Upload API (single_part mode).
+
+        1. POST /file_uploads to reserve an upload slot.
+        2. POST the raw bytes as multipart/form-data to the returned upload URL.
+
+        Returns the file_upload object (status should be "uploaded" on success).
+        """
+        filename = filename or path.name
+        content_type = content_type or mimetypes.guess_type(filename)[0] or "application/octet-stream"
+
+        created = self.post("/file_uploads", {"filename": filename, "content_type": content_type})
+        upload_url = created.get("upload_url") or f"{API_BASE}/file_uploads/{created['id']}/send"
+
+        boundary = uuid.uuid4().hex
+        data = path.read_bytes()
+        body = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+            f"Content-Type: {content_type}\r\n\r\n"
+        ).encode("utf-8") + data + f"\r\n--{boundary}--\r\n".encode("utf-8")
+
+        request = urllib.request.Request(
+            upload_url,
+            data=body,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {self.token}",
+                "Notion-Version": self.notion_version,
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request) as response:
+                raw = response.read().decode("utf-8")
+        except urllib.error.HTTPError as error:
+            raw = error.read().decode("utf-8", errors="replace")
+            try:
+                payload_data = json.loads(raw)
+                message = payload_data.get("message", raw)
+                code = payload_data.get("code")
+            except json.JSONDecodeError:
+                message = raw
+                code = None
+            raise NotionError(error.code, error.reason, message, code) from error
+
+        return json.loads(raw) if raw else created
+
     def collect_paginated_post(
         self,
         path: str,
@@ -224,6 +274,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_database_parser(subparsers)
     add_data_source_parser(subparsers)
     add_user_parser(subparsers)
+    add_file_parser(subparsers)
 
     return parser
 
@@ -424,6 +475,23 @@ def add_data_source_parser(subparsers: argparse._SubParsersAction[argparse.Argum
     update.add_argument("data_source")
     update.add_argument("--body", required=True, help="JSON body, @file.json, or - for stdin.")
     update.set_defaults(func=cmd_data_source_update)
+
+
+def add_file_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    file_parser = subparsers.add_parser("file", help="Upload local files to Notion (File Upload API).")
+    file_sub = file_parser.add_subparsers(required=True)
+
+    upload = file_sub.add_parser(
+        "upload",
+        help="Upload a local file, optionally attaching it as a file block to a page or block.",
+    )
+    upload.add_argument("path", help="Path to the local file to upload.")
+    upload.add_argument("--filename", help="Override the filename sent to Notion (default: basename of path).")
+    upload.add_argument("--content-type", help="Override the MIME type (default: guessed from filename).")
+    upload.add_argument("--page", help="Page ID/URL to append the uploaded file to as a file block.")
+    upload.add_argument("--block", help="Block ID/URL to append the uploaded file to as a file block (alternative to --page).")
+    upload.add_argument("--caption", help="Optional caption text for the attached file block.")
+    upload.set_defaults(func=cmd_file_upload)
 
 
 def add_user_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -686,6 +754,36 @@ def cmd_data_source_create(client: NotionClient, args: argparse.Namespace) -> in
 
 def cmd_data_source_update(client: NotionClient, args: argparse.Namespace) -> int:
     emit_json(client.patch(f"/data_sources/{parse_notion_id(args.data_source)}", read_json_arg(args.body)))
+    return 0
+
+
+def cmd_file_upload(client: NotionClient, args: argparse.Namespace) -> int:
+    path = Path(args.path).expanduser()
+    if not path.is_file():
+        raise ValueError(f"File not found: {path}")
+
+    uploaded = client.upload_file(path, filename=args.filename, content_type=args.content_type)
+    result: dict[str, Any] = {"file_upload": uploaded}
+
+    target_block = args.page or args.block
+    if target_block:
+        file_block: dict[str, Any] = {
+            "type": "file",
+            "file": {
+                "type": "file_upload",
+                "file_upload": {"id": uploaded["id"]},
+            },
+        }
+        if args.caption:
+            file_block["file"]["caption"] = [{"type": "text", "text": {"content": args.caption}}]
+        append_result = client.patch(
+            f"/blocks/{parse_notion_id(target_block)}/children",
+            {"children": [file_block]},
+        )
+        result["appended_to"] = parse_notion_id(target_block)
+        result["append_result"] = append_result
+
+    emit_json(result)
     return 0
 
 
