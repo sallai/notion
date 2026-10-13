@@ -528,6 +528,37 @@ def cmd_me(client: NotionClient, _args: argparse.Namespace) -> int:
     return 0
 
 
+DATABASE_QUERY_PATH_RE = re.compile(
+    r"^/databases/([0-9a-fA-F-]{32,36})/query(?:\?.*)?$"
+)
+
+
+def resolve_database_query_path(client: NotionClient, path: str) -> str:
+    """Notion has retired POST /databases/{id}/query for databases migrated to the
+    multi-data-source model (fails with 400 invalid_request_url). Transparently
+    redirect such calls to the equivalent POST /data_sources/{id}/query, so existing
+    callers that still target the old database-query path keep working."""
+    match = DATABASE_QUERY_PATH_RE.match(path)
+    if not match:
+        return path
+
+    database_id = match.group(1)
+    database = client.get(f"/databases/{database_id}")
+    data_sources = database.get("data_sources") or []
+    if not data_sources:
+        return path
+
+    data_source_id = data_sources[0]["id"]
+    print(
+        f"Note: /databases/{database_id}/query is deprecated for this database; "
+        f"querying /data_sources/{data_source_id}/query instead.",
+        file=sys.stderr,
+        flush=True,
+    )
+    suffix = path[match.end(1):]
+    return f"/data_sources/{data_source_id}{suffix}"
+
+
 def cmd_api(client: NotionClient, args: argparse.Namespace) -> int:
     body = read_json_arg(args.data) if args.data else None
 
@@ -539,11 +570,14 @@ def cmd_api(client: NotionClient, args: argparse.Namespace) -> int:
             return 0
         if args.method == "POST":
             path = add_query_params(args.path, args.query)
+            path = resolve_database_query_path(client, path)
             emit_json(client.collect_paginated_post(path, body))
             return 0
         raise ValueError("--paginate is only supported for GET and POST list endpoints.")
 
     path = add_query_params(args.path, args.query)
+    if args.method == "POST":
+        path = resolve_database_query_path(client, path)
     emit_json(client.request(args.method, path, body))
     return 0
 
