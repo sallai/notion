@@ -11,6 +11,7 @@ import json
 import mimetypes
 import os
 import re
+import subprocess
 import sys
 import time
 import urllib.error
@@ -23,6 +24,15 @@ from typing import Any
 
 DEFAULT_NOTION_VERSION = "2026-03-11"
 API_BASE = "https://api.notion.com/v1"
+
+# Skill self-update check: this file lives at <skill-dir>/scripts/notion-cli, and
+# <skill-dir> is its own git repo (a submodule in the parent project). Periodically
+# (see UPDATE_CHECK_INTERVAL_SECONDS) compare local HEAD to the remote's HEAD and,
+# if behind, print a one-line notice so the user can ask their agent to pull the
+# update. Never blocks or fails the command this runs alongside.
+SKILL_DIR = Path(__file__).resolve().parent.parent
+UPDATE_CHECK_CACHE = Path.home() / ".notion" / "update-check.json"
+UPDATE_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 NOTION_ENV_FILES = [
     Path.home() / ".notion" / "env",
     Path.home() / ".notion" / "notion.env",
@@ -210,11 +220,62 @@ class NotionClient:
             cursor = response.get("next_cursor")
 
 
+def check_for_skill_update() -> None:
+    """Best-effort, throttled check for a newer commit on the skill's own remote.
+    Never raises; any failure (no git, no network, not a repo, etc.) is swallowed."""
+    try:
+        state: dict[str, Any] = {}
+        if UPDATE_CHECK_CACHE.exists():
+            try:
+                state = json.loads(UPDATE_CHECK_CACHE.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                state = {}
+
+        now = time.time()
+        if now - float(state.get("last_checked", 0)) >= UPDATE_CHECK_INTERVAL_SECONDS:
+            local = _git_output(["rev-parse", "HEAD"])
+            remote_line = _git_output(["ls-remote", "origin", "HEAD"])
+            remote = remote_line.split()[0] if remote_line else None
+            state["last_checked"] = now
+            if local and remote:
+                state["update_available"] = local != remote
+                state["local"] = local[:12]
+                state["remote"] = remote[:12]
+            UPDATE_CHECK_CACHE.parent.mkdir(parents=True, exist_ok=True)
+            UPDATE_CHECK_CACHE.write_text(json.dumps(state), encoding="utf-8")
+
+        if state.get("update_available"):
+            print(
+                f"ℹ️  notion-cli has an update available upstream (local {state.get('local', '?')}, "
+                f"remote {state.get('remote', '?')}). Ask your agent to pull the latest skill version if you'd like it.",
+                file=sys.stderr,
+                flush=True,
+            )
+    except Exception:
+        pass
+
+
+def _git_output(args: list[str]) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(SKILL_DIR), *args],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if result.returncode != 0:
+            return None
+        return result.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
 def main() -> int:
     global OUTPUT_FORMAT, STARTED_AT
     STARTED_AT = time.perf_counter()
     args = build_parser().parse_args()
     OUTPUT_FORMAT = args.output
+    check_for_skill_update()
 
     try:
         if args.schema:

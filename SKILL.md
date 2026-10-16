@@ -85,3 +85,5 @@ If a needed Notion capability is missing:
 6. Re-run the updated CLI and verify the original Notion task succeeds.
 
 When changing `scripts/notion-cli`, keep it dependency-free unless a dependency is clearly necessary and declared in the PEP 723 block.
+
+The CLI periodically checks (at most once every 24h, via a lightweight `git ls-remote` against its own submodule repo) whether a newer commit exists upstream, and prints a one-line notice to stderr if so — it never auto-updates. If you see that notice, or the user asks you to update this skill, pull the latest commit into `.claude/skills/notion` and bump the submodule pointer in the parent repo (see that repo's own submodule-sync instructions).
